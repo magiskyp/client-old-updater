@@ -798,6 +798,113 @@ def build_hash_mapping(payload: Dict[str, object]) -> Dict[str, str]:
     return mapping
 
 
+def unwrap_parenthesized_expression(
+    tokens: Sequence[Token], start_index: int, end_index: int
+) -> Tuple[int, int]:
+    while (
+        end_index - start_index >= 2
+        and tokens[start_index].value == "("
+        and find_matching_token(tokens, start_index) == end_index - 1
+    ):
+        start_index += 1
+        end_index -= 1
+    return start_index, end_index
+
+
+def find_expression_end(tokens: Sequence[Token], start_index: int) -> int:
+    paren_depth = 0
+    brace_depth = 0
+    bracket_depth = 0
+
+    for index in range(start_index, len(tokens)):
+        value = tokens[index].value
+        if value == "(":
+            paren_depth += 1
+        elif value == ")":
+            paren_depth -= 1
+        elif value == "{":
+            brace_depth += 1
+        elif value == "}":
+            brace_depth -= 1
+        elif value == "[":
+            bracket_depth += 1
+        elif value == "]":
+            bracket_depth -= 1
+        elif value == ";" and paren_depth == brace_depth == bracket_depth == 0:
+            return index
+    return len(tokens)
+
+
+def parse_value_reference(
+    tokens: Sequence[Token], start_index: int, end_index: int
+) -> Optional[Tuple[str, object]]:
+    start_index, end_index = unwrap_parenthesized_expression(
+        tokens, start_index, end_index
+    )
+    if start_index >= end_index:
+        return None
+
+    if end_index - start_index == 1:
+        token = tokens[start_index]
+        if token.kind in ("string", "number"):
+            return ("literal", start_index)
+        if token.kind == "identifier":
+            return ("identifier", token.value)
+        return None
+
+    if (
+        tokens[start_index].kind == "identifier"
+        and tokens[start_index].value in ("String", "Number")
+        and start_index + 1 < end_index
+        and tokens[start_index + 1].value == "("
+        and find_matching_token(tokens, start_index + 1) == end_index - 1
+    ):
+        wrapped_args = split_top_level_args(tokens, start_index + 2, end_index - 1)
+        if len(wrapped_args) == 1:
+            return parse_value_reference(tokens, *wrapped_args[0])
+
+    if (
+        end_index - start_index == 3
+        and tokens[start_index].kind == "identifier"
+        and tokens[start_index + 1].value in (".", "?.")
+        and tokens[start_index + 2].kind == "identifier"
+    ):
+        return ("property", tokens[start_index + 2].value)
+
+    return None
+
+
+def parse_array_first_value_reference(
+    tokens: Sequence[Token], start_index: int, end_index: int
+) -> Optional[Tuple[str, object]]:
+    start_index, end_index = unwrap_parenthesized_expression(
+        tokens, start_index, end_index
+    )
+    if start_index >= end_index:
+        return None
+
+    if end_index - start_index == 1 and tokens[start_index].kind == "identifier":
+        return ("array_identifier", tokens[start_index].value)
+
+    if (
+        tokens[start_index].value != "["
+        or find_matching_token(tokens, start_index) != end_index - 1
+    ):
+        return None
+
+    entries = split_top_level_args(tokens, start_index + 1, end_index - 1)
+    if not entries:
+        return None
+
+    return parse_value_reference(tokens, *entries[0])
+
+
+def is_constant_like_name(value: str) -> bool:
+    return bool(value) and all(
+        char == "_" or char.isdigit() or ("A" <= char <= "Z") for char in value
+    )
+
+
 def collect_remote_call_targets(tokens: Sequence[Token]) -> List[Tuple[str, int]]:
     targets: List[Tuple[str, int]] = []
 
@@ -833,14 +940,18 @@ def collect_remote_call_targets(tokens: Sequence[Token]) -> List[Tuple[str, int]
             continue
 
         arg_start, arg_end = args[0]
-        if arg_end - arg_start != 1:
-            continue
-
-        first_arg = tokens[arg_start]
-        if first_arg.kind in ("string", "number"):
-            targets.append(("literal", arg_start))
-        elif first_arg.kind == "identifier":
-            targets.append(("identifier", arg_start))
+        if arg_end - arg_start == 1:
+            first_arg = tokens[arg_start]
+            if first_arg.kind in ("string", "number"):
+                targets.append(("literal", arg_start))
+            elif first_arg.kind == "identifier":
+                targets.append(("identifier", arg_start))
+        elif (
+            arg_end - arg_start == 2
+            and tokens[arg_start].value == "..."
+            and tokens[arg_start + 1].kind == "identifier"
+        ):
+            targets.append(("spread_identifier", arg_start + 1))
 
     return targets
 
@@ -851,6 +962,8 @@ def update_script_file(script_path: Path, hash_mapping: Dict[str, str]) -> Dict[
     line_starts = compute_line_starts(script_text)
     replacements: Dict[int, Dict[str, object]] = {}
     referenced_identifiers: set[str] = set()
+    referenced_arrays: set[str] = set()
+    referenced_properties: set[str] = set()
     old_script_path = script_path.with_name(f"{script_path.stem}-old{script_path.suffix}")
     new_script_path = script_path.with_name(f"{script_path.stem}-new{script_path.suffix}")
 
@@ -880,31 +993,111 @@ def update_script_file(script_path: Path, hash_mapping: Dict[str, str]) -> Dict[
             "new_text": new_text,
         }
 
+    def add_identifier(name: str) -> bool:
+        if name in referenced_identifiers:
+            return False
+        referenced_identifiers.add(name)
+        return True
+
+    def add_array(name: str) -> bool:
+        if name in referenced_arrays:
+            return False
+        referenced_arrays.add(name)
+        return True
+
+    def add_property(name: str) -> bool:
+        if name in referenced_properties:
+            return False
+        referenced_properties.add(name)
+        return True
+
+    def apply_reference(
+        reference: Optional[Tuple[str, object]], replacement_reason: str
+    ) -> bool:
+        if reference is None:
+            return False
+
+        reference_type, reference_value = reference
+        if reference_type == "literal":
+            queue_replacement(int(reference_value), replacement_reason)
+            return False
+        if reference_type == "identifier":
+            return add_identifier(str(reference_value))
+        if reference_type == "property":
+            return add_property(str(reference_value))
+        if reference_type == "array_identifier":
+            return add_array(str(reference_value))
+        return False
+
     for target_type, token_index in collect_remote_call_targets(tokens):
         token = tokens[token_index]
         if target_type == "literal":
             queue_replacement(token_index, "direct_call_argument")
         elif target_type == "identifier":
-            referenced_identifiers.add(token.value)
+            add_identifier(token.value)
+        elif target_type == "spread_identifier":
+            add_array(token.value)
 
-    for index in range(len(tokens) - 3):
-        if (
-            tokens[index].value in ("const", "let", "var")
-            and tokens[index + 1].kind == "identifier"
-            and tokens[index + 1].value in referenced_identifiers
-            and tokens[index + 2].value == "="
-            and tokens[index + 3].kind in ("string", "number")
-        ):
-            queue_replacement(index + 3, f"variable_initializer:{tokens[index + 1].value}")
+    changed = True
+    while changed:
+        changed = False
 
-        if (
-            tokens[index].kind == "identifier"
-            and tokens[index].value in referenced_identifiers
-            and tokens[index + 1].value == "="
-            and tokens[index + 2].kind in ("string", "number")
-            and (index == 0 or tokens[index - 1].value not in (".", ":"))
-        ):
-            queue_replacement(index + 2, f"variable_assignment:{tokens[index].value}")
+        for index in range(len(tokens) - 2):
+            if (
+                tokens[index].value in ("const", "let", "var")
+                and tokens[index + 1].kind == "identifier"
+                and tokens[index + 2].value == "="
+            ):
+                name = tokens[index + 1].value
+                expr_start = index + 3
+                expr_end = find_expression_end(tokens, expr_start)
+
+                if name in referenced_identifiers:
+                    changed = apply_reference(
+                        parse_value_reference(tokens, expr_start, expr_end),
+                        f"variable_initializer:{name}",
+                    ) or changed
+
+                if name in referenced_arrays:
+                    changed = apply_reference(
+                        parse_array_first_value_reference(tokens, expr_start, expr_end),
+                        f"array_initializer:{name}",
+                    ) or changed
+
+            if (
+                tokens[index].kind == "identifier"
+                and tokens[index + 1].value == "="
+                and (index == 0 or tokens[index - 1].value not in (".", ":"))
+            ):
+                name = tokens[index].value
+                expr_start = index + 2
+                expr_end = find_expression_end(tokens, expr_start)
+
+                if name in referenced_identifiers:
+                    changed = apply_reference(
+                        parse_value_reference(tokens, expr_start, expr_end),
+                        f"variable_assignment:{name}",
+                    ) or changed
+
+                if name in referenced_arrays:
+                    changed = apply_reference(
+                        parse_array_first_value_reference(tokens, expr_start, expr_end),
+                        f"array_assignment:{name}",
+                    ) or changed
+
+        for index in range(len(tokens) - 2):
+            if (
+                (
+                    tokens[index].value in referenced_properties
+                    or is_constant_like_name(tokens[index].value)
+                )
+                and tokens[index + 1].value == ":"
+                and tokens[index + 2].kind in ("string", "number")
+                and (index == 0 or tokens[index - 1].value in ("{", ","))
+            ):
+                queue_replacement(
+                    index + 2, f"object_property_initializer:{tokens[index].value}"
+                )
 
     updated_text = script_text
     if replacements:
